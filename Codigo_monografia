@@ -1,0 +1,243 @@
+library(readxl)
+df<-read_excel("BD1.xlsx")
+df<-data.frame(df[,6:7])
+attach(df)
+
+df$fecha<-as.Date(df$fecha,format="%Y-%m-%d")
+class(df$fecha)
+
+library(dplyr)
+
+#Agrupar los datos diarios
+df<- df %>%
+  group_by(fecha) %>%
+  summarize(sum_casos=sum(count))
+
+#Genarar secuencia de dias para validar los datos faltantes
+
+library(lubridate)
+
+dias_completos<-data.frame(
+  fecha=seq(
+    floor_date(min(df$fecha),unit ='day'),
+    floor_date(max(df$fecha),unit = 'day'),
+    by= 'day'
+  ))
+
+df<-merge(x=dias_completos, y=df, all=TRUE)
+attach(df)
+
+#Identificar los NA 
+which(is.na(df))
+
+#Imputar datos faltantes con la mediana de la serie
+df$sum_casos[is.na(df$sum_casos)]<-median(df$sum_casos,na.rm = TRUE)
+
+#Validar si quedan datos faltantes en la serie
+which(is.na(df))
+
+#Gráfico de la BD
+require(ggplot2)
+df %>% 
+  ggplot(aes(x = fecha, y = sum_casos)) +
+  geom_line()+
+  xlab("Año Solicitud")+
+  ylab("Cantidad Solicitudes")+
+  ggtitle("Serie Temporal")
+
+#Convertir el data frame a una serie de tiempo
+serie<-ts(df$sum_casos, frequency=7)
+
+#Análisis Descriptivo
+
+stl_serie<-stl(x=serie,s.window = "periodic")
+plot(stl_serie)
+
+#Para pasar la serie de diaria a Mensual
+
+df1<-cbind(df,Periodo=c(format(as.Date(df$fecha),"%Y%m")))
+
+by_periodo<- df1 %>%
+  group_by(Periodo) %>%
+  summarize(sum_casos=sum(sum_casos))
+
+lista<-(by_periodo$sum_casos)
+
+serie_temp<-ts(lista,freq=12,start=c(2018,1))
+str(serie_temp)
+
+#Gráficos de la serie acumulada mensual
+
+plot(serie_temp,main="Solicitudes de PQRS Enero/2018 Diciembre/2021",xlab="Año",ylab="Cantidad")
+grid()
+
+stl_serie_m<-stl(x=serie_temp,s.window = "periodic")
+plot(stl_serie_m)
+
+#Partición de los datos de entrenamiento a pronóstico
+
+m<- 58
+n<- length(serie)
+yi<- ts(serie[1:(n-m)],frequency=7, start=c(2018,1))
+yf<- ts(serie[(n-m+1):n],frequency=7,start=c(2021,11))
+t<- seq(1,length(yi))
+
+#--- Modelo cuadrático mas indicadoras
+
+library(forecast)
+It<- seasonaldummy(yi)
+t2 <- t*t
+mod1<- lm(yi ~ t + t2 + It)
+summary(mod1)
+
+yhat1<- fitted(mod1)
+
+# ----Gráfico de los valores ajustados (yhat) versus los datos observados (yi) para el período de entrenamiento (i)
+
+fecha.yhat<- seq(as.Date("2018/01/02"), length.out=n-m, by="days")
+
+plot(fecha.yhat[1:250], yi[1:250], 
+     type="o", col="blue", pch="o", lty=1, ylim=c(0,900)
+     ,ylab = "Cantidad Solicitudes" ,xlab = "2018")
+points(fecha.yhat[1:250], yhat1[1:250], col="red", pch="*")
+lines(fecha.yhat[1:250], yhat1[1:250], col="red",lty=2)
+legend("topright", legend = c("Observados","Cuadratico"),
+       lwd = 3, col = c("blue", "red"), pch = c("o","*"))
+
+#-----eliminar la tendencia con stl()
+m1 <-stl(serie, s.window = 'per')
+s1 <- m1$time.series[,1]; e1 = m1$time.series[,3];
+y1 <- s1+e1
+ts.plot(y1)
+
+#-----------Canova-Hansen
+require(uroot) 
+res = ch.test(y1, type = "trigonometric", pvalue='raw')
+res
+
+#----Prueba Hegy----
+hegy.out1 = hegy.test(x=serie, deterministic = c(1,1,1),
+                      lag.method = "fixed", maxlag = 1)
+hegy.out1
+
+#-----Prueba OCSB
+require(forecast)
+ocsb.test(serie)
+
+#---pronosticos con modelo cuadrático y medición del desempeño de los pronosticos
+
+tf = seq((n-m+1),n,1)
+Itf = seasonaldummy(yi,m)
+tf2 = tf*tf
+
+pron1 = predict(mod1,
+                data.frame(t = tf,t2 = tf2, It=I(Itf)))
+
+pron1 = ts(pron1,frequency=7,start=c(2021,11))
+(H.cuad.est = accuracy(pron1,yf))
+
+#-----------calcular residuos estructurales mod 1 cuadrático + indicadoras
+yr = resid(mod1)
+yr = ts(yr,frequency=7)
+
+#--- Gráficar la fac
+
+par(mfrow=c(1,2))
+TSA::acf(yr,60,ci.type="ma",drop.lag.0 = TRUE,main="")
+pacf(yr,60,main=" ")
+
+##Pruebas de incorrelación Ljung-Box y Durbin-Watson 
+library(car)
+
+Box.test(x = yr, lag = 7, type="Ljung-Box")
+Box.test(x = yr, lag = 14, type="Ljung-Box")
+Box.test(x = yr, lag = 21, type="Ljung-Box")
+
+#------------identificador auto.arima para el SARMA  de los residuales
+
+auto.arima(yr)
+auto.arima(yr,stationary=TRUE, seasonal=TRUE,ic= "aicc")
+
+mod2 = arima(yr,order=c(1,0,2),seasonal=
+              list(order=c(1,0,1),period=7))
+
+require(lmtest)
+coeftest(mod2)
+
+#Pruebas de incorrelación cuadrático más S-Arma
+yhat2 <- resid(mod2)
+
+par(mfrow=c(1,2))
+TSA::acf(yhat2,60,ci.type="ma",drop.lag.0 = TRUE,main="")
+pacf(yhat2,60,main=" ")
+
+Box.test(x = yhat2, lag = 7, type="Ljung-Box")
+Box.test(x = yhat2, lag = 14, type="Ljung-Box")
+Box.test(x = yhat2, lag = 21, type="Ljung-Box")
+
+#------------calcular pronósticos a 58 dias
+tf = seq((n-m+1),n,1)
+Itf = seasonaldummy(yi,m)
+tf2 = tf*tf
+
+py.l = predict(mod1, data.frame(t = tf,t2 = tf2, It=I(Itf)))
+p.arma = predict(mod2,n.ahead=58)$pred
+py.tot = py.l+p.arma
+py.tot = ts(py.tot,frequency=7,start=c(2021,11))
+
+#----------SARIMA-----
+dyos = diff(diff(yi,7,1),1,1)
+dys = diff(yi,7,1)
+dyo = diff(yi,1,1)
+dyos = ts(dyos,frequency=7)
+
+par(mfrow=c(2,1))
+acf(dyos,ci.type='ma',60,main="")
+pacf(dyos,60,main="")
+
+auto.arima(yi)
+mod.sarima = arima(yi,order=c(0,0,1),
+                   seasonal=list(order=c(0,1,1),period=7))
+library(lmtest)
+coeftest(mod.sarima)
+r.sarima = mod.sarima$residuals
+
+par(mfrow=c(1,2))
+acf(r.sarima,ci.type='ma',60,main="")
+pacf(r.sarima,60,main="")
+
+Box.test(x = r.sarima, lag = 7, type="Ljung-Box")
+Box.test(x = r.sarima, lag = 14, type="Ljung-Box")
+Box.test(x = r.sarima, lag = 21, type="Ljung-Box")
+
+#-----Pronósticos SARIMA
+pron.sarima<- predict(mod.sarima, n.ahead=58)$pred
+pron.sarima <- ts(pron.sarima,frequency=7,start=c(2021,11))
+
+#-------------Medidas de calidad de los pronÃ³sticos
+(H.cuad.tot = accuracy(py.tot,yf))
+(H.sarima = accuracy(pron.sarima,yf))
+(H.cuad = accuracy(pron1,yf))
+H = rbind(H.cuad,H.cuad.tot,H.sarima)
+H = H[,-c(1,3,4)]
+oh <- order(H[,2])
+rownames(H) =c("Cuadrático","cuadratico+SARMA", "Sarima")
+(H[oh,])
+
+#------------Gráfico de los pronósticos vs los datos reales
+
+fecha.p = seq(as.Date("2021/11/03"), length.out=m, by="days")
+plot(fecha.p, yf, type="o", col="blue", pch="o", lty=1, ylim=c(0,900),
+     lwd=2, xlab="Fechas", ylab="Cantidad Solicitudes")
+
+points(fecha.p, pron1, col="black", pch="^")
+lines(fecha.p, pron1, col="black",lty=2, lwd=2)
+
+points(fecha.p, py.tot, col="green", pch="+")
+lines(fecha.p, py.tot, col="green",lty=2, lwd=2)
+
+points(fecha.p, pron.sarima, col="red", pch="*")
+lines(fecha.p, pron.sarima, col="red",lty=2, lwd=2)
+
+legend("topright",legend=c("Observados","Cuadrático","Cuadrático+SARMA","SARIMA"),
+       lwd = 1, col = c("blue","black","green","red"),pch=c("o","^","+","*"))
